@@ -1,7 +1,3 @@
-/* This is the main file for the `whoosh` interpreter and the part
- that you modify. */
-
-
 //Adam Rosenberg
 //Objective here is to create a shell that accepts the whoosh language. Supports simotaneous process running, assigning output of programs to variables, and pipelining between n number of programs. 
 
