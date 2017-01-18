@@ -3,7 +3,7 @@
 #include <string.h>
 
 // adam rosenberg
-// Objective here it so recognize regular expressions as assigned in the lab
+// Objective here is to recognize some regular expressions
 
 int aflag = 0;
 int bflag = 0;
