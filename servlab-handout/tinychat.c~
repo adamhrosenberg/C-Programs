@@ -1,0 +1,344 @@
+
+#include "csapp.h"
+#include "dictionary.h"
+#include "more_string.h"
+#include <unistd.h>
+
+void doit(int fd);
+dictionary_t *read_requesthdrs(rio_t *rp);
+void read_postquery(rio_t *rp, dictionary_t *headers, dictionary_t *d);
+void parse_query(const char *uri, dictionary_t *d);
+void serve_form(int fd, const char *pre_content);
+void clienterror(int fd, char *cause, char *errnum, char *shortmsg, char *longmsg);
+static char *ok_header(size_t len, const char *content_type);
+void push_chat(char* conversation, int fd);
+void send_page(int fd, char* entry);
+void server_chat_form(int fd, char* conversation, char* topic, char* user);
+dictionary_t *chats;
+
+char *html_footer = "</body></html>";
+
+int main(int argc, char **argv) {
+  int listenfd, connfd;
+  char hostname[MAXLINE], port[MAXLINE];
+  socklen_t clientlen;
+  struct sockaddr_storage clientaddr;
+
+  /* Check command line args */
+  if (argc != 2) {
+    fprintf(stderr, "usage: %s <port>\n", argv[0]);
+    exit(1);
+  }
+
+
+  listenfd = Open_listenfd(argv[1]);
+  chats = make_dictionary(COMPARE_CASE_SENS, free);
+
+  /* Don't kill the server if there's an error, because
+     we want to survive errors due to a client. But we
+     do want to report errors. */
+  exit_on_error(0);
+
+  /* Also, don't stop on broken connections: */
+  Signal(SIGPIPE, SIG_IGN);
+
+
+
+  while (1) {
+    clientlen = sizeof(clientaddr);
+    connfd = Accept(listenfd, (SA *)&clientaddr, &clientlen);
+    if (connfd >= 0) {
+      Getnameinfo((SA *) &clientaddr, clientlen, hostname, MAXLINE,
+                  port, MAXLINE, 0);
+      doit(connfd);
+    }
+  }
+
+
+  free_dictionary(chats);
+}
+
+
+
+/*
+ * doit - handle one HTTP request/response transaction
+ */
+void doit(int fd) {
+  char buf[MAXLINE], *method, *uri, *version;
+  char *extended_convo, *topic, *conv, *entry, *name, *content;
+
+  rio_t rio;
+  dictionary_t *headers, *query;
+
+  /* Read request line and headers */
+  Rio_readinitb(&rio, fd);
+  if (Rio_readlineb(&rio, buf, MAXLINE) <= 0) {
+    return;
+  }
+
+  if (!parse_request_line(buf, &method, &uri, &version)) {
+    clienterror(fd, method, "400", "Bad Request",
+                "TinyChat did not recognize the request");
+  } else {
+    if (strcasecmp(version, "HTTP/1.0")
+        && strcasecmp(version, "HTTP/1.1")) {
+      clienterror(fd, version, "501", "Not Implemented",
+                  "TinyChat does not implement that version");
+    } else if (strcasecmp(method, "GET")
+               && strcasecmp(method, "POST")) {
+      clienterror(fd, method, "501", "Not Implemented",
+                  "TinyChat does not implement that method");
+    } else {
+      headers = read_requesthdrs(&rio);
+      query = make_dictionary(COMPARE_CASE_SENS, free);
+      parse_uriquery(uri, query);
+      if (!strcasecmp(method, "POST")) {
+          read_postquery(&rio, headers, query);
+      }
+
+
+      if(!strcasecmp(uri, "/")) {
+          serve_form(fd, "Welcome to TinyChat");
+      } else if(!strcasecmp(uri, "/chat")) {
+
+          topic = dictionary_get(query, "topic");
+          if(topic == NULL) {
+              clienterror(fd, method, "403", "Not authenticated",
+                          "Error");
+              return;
+          }
+
+          conv = dictionary_get(chats, topic);
+
+          if(conv == NULL) {
+              conv = malloc(1);
+              conv[0] = 0;
+              dictionary_set(chats, topic, conv);
+          }
+
+
+          if(dictionary_get(query, "content") != NULL && strlen(dictionary_get(query, "content")) > 0) {
+        	  char * user = dictionary_get(query, "user");
+        	  char * content = dictionary_get(query, "content");
+              entry = append_strings(user,": ", content,
+                                           "\r\n", NULL);
+              extended_convo = append_strings(conv, entry, NULL);
+              dictionary_set(chats, topic, extended_convo);
+              free(entry);
+          } else {
+              extended_convo = conv;
+          }
+          server_chat_form(fd, extended_convo, topic, dictionary_get(query,"user"));
+      } else if (starts_with("/conv", uri)) {
+          topic = dictionary_get(query, "topic");
+
+          conv = dictionary_get(chats, topic);
+          conv = conv ? conv : ""; // if null, make empty string
+          push_chat(conv,fd);
+
+      } else if(starts_with("/say", uri)) {
+          topic = dictionary_get(query, "topic");
+          name = dictionary_get(query, "user");
+          content = dictionary_get(query, "content");
+          if(content == NULL) {
+              content = "";
+          }
+
+          conv = dictionary_get(chats, topic);
+          conv = conv ? conv : "";
+
+          entry = append_strings(name, ": ", content, "\r\n", NULL);
+          dictionary_set(chats, topic, append_strings(conv, entry, NULL));
+          /*unlock*/
+          send_page(fd, entry);
+          free(entry);
+      } else if (starts_with("/import", uri)) {
+    	  	  //did not get to this.
+      }
+      /* Clean up */
+      free_dictionary(query);
+      free_dictionary(headers);
+    }
+
+    /* Clean up status line */
+    free(method);
+    free(uri);
+    free(version);
+  }
+}
+
+void send_page(int fd, char* entry) {
+    char *header, *body;
+    body = append_strings("inserted ", entry, "\r\n", NULL);
+    size_t bod_len = strlen(body);
+
+    header = ok_header(bod_len, "text/plain; charset=utf-8");
+    Rio_writen(fd, header, strlen(header));
+    Rio_writen(fd, body, bod_len);
+    free(header);
+    free(body);
+}
+
+void push_chat(char* conversation, int fd) {
+    char *header;
+    size_t len;
+    len = strlen(conversation);
+    header = ok_header(len, "text/plain; charset=utf-8");
+    Rio_writen(fd, header, strlen(header)); // send header
+    Rio_writen(fd, conversation, len); // send body
+
+    free(header);
+}
+
+void server_chat_form(int fd, char* conversation, char* topic, char* user) {
+      size_t len;
+  char *body, *header;
+  const char *head = "<html><body>";
+
+  body = append_strings(head,"<h3 style=text-align:center>",entity_encode(topic),"</h3>"
+                        "<div class='conversation' id='convo'><pre>", entity_encode(conversation), "</pre></div>",
+                        "\r\n<form action='chat' method=\"post\" onsubmit='checkEmpty(this)'",
+                        " enctype=\"application/x-www-form-urlencoded\"",
+                        " accept-charset=\"UTF-8\">\r\n",
+                        "<input type='hidden' name=\"topic\" value='", entity_encode(topic), "'><br>",
+                        "<input type='hidden' name=\"user\" value='", entity_encode(user), "'><br>",
+                        "<label for='content'>Content: </label>"
+                        "<input type=\"submit\" value=\"Send\" >",
+                        "</form>",html_footer,
+                        NULL);
+
+  len = strlen(body);
+
+  /* Send response headers to client */
+  header = ok_header(len, "text/html; charset=utf-8");
+  Rio_writen(fd, header, strlen(header));
+
+  free(header);
+
+  /* Send response body to client */
+  Rio_writen(fd, body, len);
+
+  free(body);
+}
+
+/*
+ * read_requesthdrs - read HTTP request headers
+ */
+dictionary_t *read_requesthdrs(rio_t *rp)
+{
+  char buf[MAXLINE];
+  dictionary_t *d = make_dictionary(COMPARE_CASE_INSENS, free);
+
+  Rio_readlineb(rp, buf, MAXLINE);
+  //  printf("%s", buf);
+  while(strcmp(buf, "\r\n")) {
+    Rio_readlineb(rp, buf, MAXLINE);
+    //    printf("%s", buf);
+    parse_header_line(buf, d);
+  }
+
+  return d;
+}
+
+void read_postquery(rio_t *rp, dictionary_t *headers, dictionary_t *dest)
+{
+  char *len_str, *type, *buffer;
+  int len;
+
+  len_str = dictionary_get(headers, "Content-Length");
+  len = (len_str ? atoi(len_str) : 0);
+
+  type = dictionary_get(headers, "Content-Type");
+
+  buffer = malloc(len+1);
+  Rio_readnb(rp, buffer, len);
+  buffer[len] = 0;
+
+  if (!strcasecmp(type, "application/x-www-form-urlencoded")) {
+    parse_query(buffer, dest);
+  }
+
+  free(buffer);
+}
+
+static char *ok_header(size_t len, const char *content_type) {
+  char *len_str, *header;
+
+  header = append_strings("HTTP/1.0 200 OK\r\n",
+                          "Server: TinyChat Web Server\r\n",
+                          "Connection: close\r\n",
+                          "Content-length: ", len_str = to_string(len), "\r\n",
+                          "Content-type: ", content_type, "\r\n\r\n",
+                          NULL);
+  free(len_str);
+
+  return header;
+}
+
+/*
+ * serve_form - sends a form to a client
+ */
+void serve_form(int fd, const char *pre_content) {
+  size_t len;
+  char *body, *header;
+  const char *head = "<html><body>";
+  body = append_strings(head,
+                        "<p>Welcome to TinyChat</p>",
+                        "\r\n<form action='chat' method=\"post\" onsubmit='checkEmpty(this)'" ,
+                        " enctype=\"application/x-www-form-urlencoded\"",
+                        " accept-charset=\"UTF-8\">\r\n",
+                        "<label for='topic'>Topic: </label>"
+                        "<input type=\"text\" name=\"topic\"><br>",
+                        "<label for='name'>Name: </label>"
+                        "<input type=\"text\" name=\"user\"><br>",
+                        "<input type=\"submit\" value=\"Send\" >",
+                        "</form>",html_footer,
+                        NULL);
+
+  len = strlen(body);
+
+  /* Send response headers to client */
+  header = ok_header(len, "text/html; charset=utf-8");
+  Rio_writen(fd, header, strlen(header));
+  //  printf("Response headers:\n");
+  //  printf("%s", header);
+
+  free(header);
+
+  /* Send response body to client */
+  Rio_writen(fd, body, len);
+
+  free(body);
+}
+
+
+/*
+ * clienterror - returns an error message to the client
+ */
+void clienterror(int fd, char *cause, char *errnum,
+		 char *shortmsg, char *longmsg)  {
+  size_t len;
+  char *header, *body, *len_str;
+
+  body = append_strings("<html><title>Tiny Error</title>",
+                        "<body bgcolor=""ffffff"">\r\n",
+                        errnum, " ", shortmsg,
+                        "<p>", longmsg, ": ", cause,
+                        "<hr><em>The Tiny Web server</em>\r\n",
+                        NULL);
+  len = strlen(body);
+
+  /* Print the HTTP response */
+  header = append_strings("HTTP/1.0 ", errnum, " ", shortmsg,
+                          "Content-type: text/html; charset=utf-8\r\n",
+                          "Content-length: ", len_str = to_string(len), "\r\n\r\n",
+                          NULL);
+  free(len_str);
+
+  Rio_writen(fd, header, strlen(header));
+  Rio_writen(fd, body, len);
+
+  free(header);
+  free(body);
+}
+
