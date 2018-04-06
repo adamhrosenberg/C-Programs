@@ -1,13 +1,3 @@
-/**
- *
- *
- * this is my mm.c I couldn't get through a couple bugs, my free list isn't working
- * as efficiently as it should. I"m using a best fit search method, with the explicit list.
- * On the cade machines I get a 10/100 on the driver and pass all of the valid checks.
- * Any partial credit would be awesome!
- *
- * Adam Rosenberg u0751643
- */
 
 
 
